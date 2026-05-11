@@ -1,0 +1,32 @@
+PROJECT_NAME           = "RAK4631 Watering LoRa P2P Master Dual Modem"
+OUTPUT_DIRECTORY       =
+
+INPUT                  = README.md README.user.md README.protocole_table.md src include
+USE_MDFILE_AS_MAINPAGE = README.md
+RECURSIVE              = NO
+FILE_PATTERNS          = *.cpp *.h *.md
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+EXTRACT_LOCAL_METHODS  = YES
+
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+GENERATE_TREEVIEW      = YES
+
+QUIET                  = NO
+WARNINGS               = YES

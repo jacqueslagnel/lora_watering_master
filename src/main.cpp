@@ -23,7 +23,7 @@
 /**
  * @brief Active modem selection used by the build.
  */
-#define MODEM MODEM_SIM7080
+#define MODEM MODEM_BG77
 
 #if MODEM == MODEM_SIM7080
 #include "sim7080_mqtt.h"

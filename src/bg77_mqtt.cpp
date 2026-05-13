@@ -37,6 +37,16 @@ static const uint8_t BG77_PWRKEY_IDLE_LEVEL = LOW;    ///< Idle GPIO level for B
 static const uint8_t BG77_PWRKEY_ACTIVE_LEVEL = HIGH; ///< Active GPIO level for BG77 PWRKEY pulse.
 static const uint32_t BG77_PWRKEY_PULSE_MS = 900;     ///< BG77 PWRKEY pulse duration, in milliseconds.
 
+struct LteProfileCandidate
+{
+    const char *name;
+    const char *plmn;
+    int act;
+    int iotopmode;
+    int rsrp;
+    bool ok;
+};
+
 /**
  * @brief Constructs the BG77 driver and initializes cached state.
  *
@@ -50,13 +60,16 @@ Bg77Mqtt::Bg77Mqtt(Print &pcSerial, Uart &modemSerial, uint32_t pwrKeyPin)
       _mqttSocketOpen(false),
       _mqttConnected(false),
       _justConnected(false),
-      _lteStatus("UNKNOWN;UNKNOWN"), //@@@ for mqtt connected
+      _lteStatus("UNKNOWN;UNKNOWN"),
+      _lastProfileName(""),
+      _lastScanSummary("B_NBIOT=NA;O_NBIOT=NA;B_CATM1=NA;O_CATM1=NA"),
       _mqttKeepAliveSec(300),
       _lastMqttOkMs(0),
       _nextReconnectAtMs(0),
       _disconnectedSinceMs(0),
       _mqttReconnectFailures(0),
       _bootPowerCycleDone(false),
+      _bootProviderScanDone(false),
       _mqttQueueHead(0),
       _mqttQueueTail(0),
       _mqttQueueCount(0)
@@ -476,9 +489,26 @@ bool Bg77Mqtt::prepareModemAfterPowerOn()
         return false;
     }
 
-    if (!sendATWaitFor("AT+CPIN?", "+CPIN: READY", nullptr, 10000, nullptr))
+    bool simReady = false;
+    uint32_t simStart = millis();
+
+    while ((uint32_t)(millis() - simStart) < 30000UL)
     {
+        watchdogFeed();
+
+        if (sendATWaitFor("AT+CPIN?", "+CPIN: READY", "ERROR", 5000, nullptr))
+        {
+            simReady = true;
+            break;
+        }
+
         logWarn("SIM pas encore READY");
+        delay(1000);
+    }
+
+    if (!simReady)
+    {
+        logError("SIM non READY apres attente");
         return false;
     }
 
@@ -547,7 +577,7 @@ bool Bg77Mqtt::bg77PowerCycle()
 
     if (!prepareModemAfterPowerOn())
     {
-        logError("BG77 ne repond pas apres rallumage");
+        logError("BG77/SIM pas pret apres rallumage");
         return false;
     }
 
@@ -634,19 +664,99 @@ static int extractNthFieldBg(const String &s, int n)
     return (int)val.toInt();
 }
 
+static String extractQcsqLineBg(const String &resp)
+{
+    int pos = resp.indexOf("+QCSQ:");
+    if (pos < 0)
+    {
+        return "";
+    }
+
+    int endN = resp.indexOf('\n', pos);
+    int endR = resp.indexOf('\r', pos);
+    int end = -1;
+
+    if (endN >= 0 && endR >= 0)
+    {
+        end = min(endN, endR);
+    }
+    else if (endN >= 0)
+    {
+        end = endN;
+    }
+    else if (endR >= 0)
+    {
+        end = endR;
+    }
+
+    String line = (end >= 0) ? resp.substring(pos, end) : resp.substring(pos);
+    line.trim();
+    return line;
+}
+
+static String qcsqTechBg(const String &resp)
+{
+    String line = extractQcsqLineBg(resp);
+    if (line.length() == 0)
+    {
+        return "UNKNOWN";
+    }
+
+    int openQuote = line.indexOf('"');
+    int closeQuote = (openQuote >= 0) ? line.indexOf('"', openQuote + 1) : -1;
+    if (openQuote < 0 || closeQuote <= openQuote)
+    {
+        return "UNKNOWN";
+    }
+
+    String tech = line.substring(openQuote + 1, closeQuote);
+    tech.replace("LTE NB-IoT", "NB-IoT");
+    tech.replace("NBIoT", "NB-IoT");
+    tech.replace("LTE Cat-M1", "Cat-M1");
+    tech.replace("eMTC", "Cat-M1");
+    tech.trim();
+    return tech;
+}
+
+static String qcsqValuesBg(const String &resp)
+{
+    String line = extractQcsqLineBg(resp);
+    if (line.length() == 0)
+    {
+        return "";
+    }
+
+    int closeQuote = line.lastIndexOf('"');
+    if (closeQuote < 0)
+    {
+        return "";
+    }
+
+    String vals = line.substring(closeQuote + 1);
+    vals.trim();
+
+    if (vals.startsWith(","))
+    {
+        vals = vals.substring(1);
+    }
+
+    vals.replace("\r", "");
+    vals.replace("\n", "");
+    vals.replace("\"", "");
+    vals.trim();
+    return vals;
+}
+
 int Bg77Mqtt::extractRsrpFromQcsq(const String &qcsqResp)
 {
-    // +QCSQ: "LTE NB-IoT",<RSSI>,<RSRP>,<SINR>,<RSRQ>
-    // After lastIndexOf('"'): ,<RSSI>,<RSRP>,...  → strip leading comma → RSSI=field0, RSRP=field1
-    int closeQuote = qcsqResp.lastIndexOf('"');
-    if (closeQuote < 0)
+    String vals = qcsqValuesBg(qcsqResp);
+    if (vals.length() == 0)
+    {
         return -999;
+    }
 
-    String vals = qcsqResp.substring(closeQuote + 1);
-    vals.trim();
-    if (vals.startsWith(","))
-        vals = vals.substring(1);
-
+    // +QCSQ: "...",<RSSI>,<RSRP>,<SINR>,<RSRQ>
+    // RSSI is field 0, RSRP is field 1.
     return extractNthFieldBg(vals, 1);
 }
 
@@ -691,35 +801,117 @@ bool Bg77Mqtt::tryNetworkProfile(const char *name,
         logWarn(String("Pas d'enregistrement reseau pour ") + name);
         return false;
     }
+    _lastProfileName = String(name);
     _lteStatus = String(name);
     _lteStatus.replace(" NB-IoT", ";NB-IoT");
     _lteStatus.replace(" Cat-M1", ";Cat-M1");
 
     logInfo(String("Profil LTE OK: ") + name);
 
-    String qcsqResp;
-    sendATWaitFor("AT+QCSQ", "+QCSQ:", nullptr, 5000, &qcsqResp);
-    int closeQuote = qcsqResp.lastIndexOf('"');
-    if (closeQuote >= 0)
+    String qcsqResp1;
+    String qcsqResp2;
+
+    int rsrp1 = -999;
+    int rsrp2 = -999;
+
+    bool haveQcsq1 = sendATWaitFor("AT+QCSQ", "+QCSQ:", nullptr, 5000, &qcsqResp1);
+
+    if (haveQcsq1)
     {
-        String vals = qcsqResp.substring(closeQuote + 1);
-        vals.trim();
-        if (vals.startsWith(","))
-            vals = vals.substring(1);
-        vals.replace(",", ";");
+        rsrp1 = extractRsrpFromQcsq(qcsqResp1);
+    }
+
+    logInfo(
+        String("QCSQ mesure 1 pour ") +
+        String(name) +
+        ": RSRP=" +
+        String(rsrp1));
+
+    delay(10000);
+
+    // Important: let late URCs arrive, then consume them before the second QCSQ.
+    delay(200);
+    while (_modem.available())
+    {
+        _modem.read();
+    }
+
+    bool haveQcsq2 = sendATWaitFor("AT+QCSQ", "+QCSQ:", nullptr, 5000, &qcsqResp2);
+
+    if (haveQcsq2)
+    {
+        rsrp2 = extractRsrpFromQcsq(qcsqResp2);
+    }
+
+    logInfo(
+        String("QCSQ mesure 2 pour ") +
+        String(name) +
+        ": RSRP=" +
+        String(rsrp2));
+
+    String bestQcsqResp;
+    int bestRsrp = -999;
+
+    if (rsrp2 > rsrp1)
+    {
+        bestQcsqResp = qcsqResp2;
+        bestRsrp = rsrp2;
+    }
+    else
+    {
+        bestQcsqResp = qcsqResp1;
+        bestRsrp = rsrp1;
+    }
+
+    if (bestRsrp > -999)
+    {
+        String vals = qcsqValuesBg(bestQcsqResp);
+
         if (vals.length() > 0)
         {
+            vals.replace(",", ";");
+            vals.replace("\"", "");
+            vals.replace("\r", "");
+            vals.replace("\n", "");
+            vals.trim();
+
             _lteStatus += ";";
             _lteStatus += vals;
         }
-    }
 
-    if (outRsrp != nullptr)
+        if (outRsrp != nullptr)
+        {
+            *outRsrp = bestRsrp;
+        }
+
+        logInfo(
+            String("QCSQ meilleur pour ") +
+            String(name) +
+            ": rsrp1=" +
+            String(rsrp1) +
+            " rsrp2=" +
+            String(rsrp2) +
+            " best=" +
+            String(bestRsrp));
+    }
+    else
     {
-        *outRsrp = extractRsrpFromQcsq(qcsqResp);
+        if (outRsrp != nullptr)
+        {
+            *outRsrp = -999;
+        }
+
+        logWarn(String("QCSQ indisponible pour ") + String(name));
     }
 
-    sendATWaitFor("AT+COPS?", "+COPS:", nullptr, 5000, nullptr);
+    // Important before COPS? because a late QCSQ line can otherwise pollute the next response.
+    delay(200);
+    while (_modem.available())
+    {
+        _modem.read();
+    }
+
+    updateProviderFromCops();
 
     return true;
 }
@@ -779,9 +971,125 @@ bool Bg77Mqtt::selectBestNbIot(bool *outPreferBouygues)
     return true;
 }
 
+bool Bg77Mqtt::selectBestLteProfile()
+{
+    logInfo("[SCAN LTE] Debut scan complet Bouygues/Orange NB-IoT/Cat-M1");
+
+    LteProfileCandidate profiles[] = {
+        {"Bouygues NB-IoT", PLMN_BOUYGUES, ACT_NBIOT, 1, -999, false},
+        {"Orange NB-IoT", PLMN_ORANGE, ACT_NBIOT, 1, -999, false},
+        {"Bouygues Cat-M1", PLMN_BOUYGUES, ACT_CATM1, 0, -999, false},
+        {"Orange Cat-M1", PLMN_ORANGE, ACT_CATM1, 0, -999, false},
+    };
+
+    const uint8_t profileCount = sizeof(profiles) / sizeof(profiles[0]);
+    int bestIndex = -1;
+    int bestRsrp = -9999;
+
+    for (uint8_t i = 0; i < profileCount; i++)
+    {
+        watchdogFeed();
+
+        if (i > 0)
+        {
+            sendATOK("AT+COPS=2", 15000);
+            delay(3000);
+        }
+
+        profiles[i].ok = tryNetworkProfile(
+            profiles[i].name,
+            profiles[i].plmn,
+            profiles[i].act,
+            profiles[i].iotopmode,
+            &profiles[i].rsrp);
+
+        if (profiles[i].ok)
+        {
+            logInfo(String("[SCAN LTE] ") + profiles[i].name +
+                    " OK RSRP=" + String(profiles[i].rsrp) + " dBm");
+
+            if (bestIndex < 0 || profiles[i].rsrp > bestRsrp)
+            {
+                bestIndex = i;
+                bestRsrp = profiles[i].rsrp;
+            }
+        }
+        else
+        {
+            logWarn(String("[SCAN LTE] ") + profiles[i].name + " indisponible");
+        }
+    }
+
+    _lastScanSummary = "";
+
+    for (uint8_t i = 0; i < profileCount; i++)
+    {
+        if (i > 0)
+        {
+            _lastScanSummary += ";";
+        }
+
+        if (strcmp(profiles[i].name, "Bouygues NB-IoT") == 0)
+        {
+            _lastScanSummary += "B_NBIOT=";
+        }
+        else if (strcmp(profiles[i].name, "Orange NB-IoT") == 0)
+        {
+            _lastScanSummary += "O_NBIOT=";
+        }
+        else if (strcmp(profiles[i].name, "Bouygues Cat-M1") == 0)
+        {
+            _lastScanSummary += "B_CATM1=";
+        }
+        else if (strcmp(profiles[i].name, "Orange Cat-M1") == 0)
+        {
+            _lastScanSummary += "O_CATM1=";
+        }
+        else
+        {
+            _lastScanSummary += "UNKNOWN=";
+        }
+
+        if (profiles[i].ok)
+        {
+            _lastScanSummary += String(profiles[i].rsrp);
+        }
+        else
+        {
+            _lastScanSummary += "-999";
+        }
+    }
+
+    if (bestIndex < 0)
+    {
+        logWarn("[SCAN LTE] Aucun profil LTE disponible");
+        return false;
+    }
+
+    logInfo(String("[SCAN LTE] Meilleur profil: ") + profiles[bestIndex].name +
+            " RSRP=" + String(profiles[bestIndex].rsrp) + " dBm");
+
+    sendATOK("AT+COPS=2", 15000);
+    delay(3000);
+
+    bool selected = tryNetworkProfile(
+        profiles[bestIndex].name,
+        profiles[bestIndex].plmn,
+        profiles[bestIndex].act,
+        profiles[bestIndex].iotopmode);
+
+    if (!selected)
+    {
+        logWarn(String("[SCAN LTE] Echec selection meilleur profil: ") + profiles[bestIndex].name);
+        return false;
+    }
+
+    return true;
+}
+
 bool Bg77Mqtt::init()
 {
-    logInfo("Init complete LTE fallback + MQTT");
+    logInfo("Init complete LTE full scan + MQTT");
 
     if (!_bootPowerCycleDone)
     {
@@ -796,47 +1104,29 @@ bool Bg77Mqtt::init()
         return false;
     }
 
-    // Chemin rapide : si déjà enregistré, sauter la sélection réseau
     updateRegistration();
 
-    if (!_networkRegistered)
+    bool registered = _networkRegistered;
+
+    if (!_bootProviderScanDone || !registered)
     {
-        sendATWaitFor("ATI", "OK", "ERROR", 5000, nullptr);
+        logInfo("Stabilisation radio avant scan LTE complet");
 
-        bool registered = false;
+        sendATOK("AT+QCFG=\"iotopmode\",1,1", 5000);
 
-        // Scan NB-IoT signal quality for both operators, register to the best one.
-        // preferBouygues informs the Cat-M1 fallback order when NB-IoT fails.
-        bool preferBouygues = true;
-        registered = selectBestNbIot(&preferBouygues);
-
-        if (!registered)
+        uint32_t stableStart = millis();
+        while ((uint32_t)(millis() - stableStart) < 30000UL)
         {
-            logWarn("Echec scan NB-IoT -> power cycle BG77");
-            bg77PowerCycle();
+            watchdogFeed();
+            delay(1000);
         }
 
-        // Cat-M1 fallback: try the operator preferred by the NB-IoT scan first
-        const char *catm1Plmn1 = preferBouygues ? PLMN_BOUYGUES : PLMN_ORANGE;
-        const char *catm1Name1 = preferBouygues ? "Bouygues Cat-M1" : "Orange Cat-M1";
-        const char *catm1Plmn2 = preferBouygues ? PLMN_ORANGE : PLMN_BOUYGUES;
-        const char *catm1Name2 = preferBouygues ? "Orange Cat-M1" : "Bouygues Cat-M1";
-
-        if (!registered)
-            registered = tryNetworkProfile(catm1Name1, catm1Plmn1, ACT_CATM1, 0);
+        registered = selectBestLteProfile();
+        _bootProviderScanDone = true;
 
         if (!registered)
         {
-            logWarn(String("Echec ") + catm1Name1 + " -> power cycle BG77");
-            bg77PowerCycle();
-        }
-
-        if (!registered)
-            registered = tryNetworkProfile(catm1Name2, catm1Plmn2, ACT_CATM1, 0);
-
-        if (!registered)
-        {
-            logWarn(String("Echec ") + catm1Name2 + " -> power cycle BG77");
+            logWarn("All LTE profiles failed, final BG77 power cycle");
             bg77PowerCycle();
             logError("Aucun profil LTE disponible");
             return false;
@@ -844,26 +1134,56 @@ bool Bg77Mqtt::init()
     }
     else
     {
-        logInfo("Deja enregistre, reconnect direct");
+        logInfo("Deja enregistre, reconnect direct sans nouveau scan LTE complet");
+    }
+
+    if (registered)
+    {
+        logInfo("LTE enregistre, lecture statut radio");
 
         String qcsqResp;
-        sendATWaitFor("AT+QCSQ", "+QCSQ:", nullptr, 5000, &qcsqResp);
-        int closeQuote = qcsqResp.lastIndexOf('"');
-        if (closeQuote >= 0)
+        bool haveQcsq = sendATWaitFor("AT+QCSQ", "+QCSQ:", nullptr, 5000, &qcsqResp);
+
+        String base;
+        if (_lastProfileName.length() > 0)
         {
-            int s1 = _lteStatus.indexOf(';');
-            int s2 = (s1 >= 0) ? _lteStatus.indexOf(';', s1 + 1) : -1;
-            String base = (s2 >= 0) ? _lteStatus.substring(0, s2) : _lteStatus;
-            String vals = qcsqResp.substring(closeQuote + 1);
-            vals.trim();
-            if (vals.startsWith(","))
-                vals = vals.substring(1);
-            vals.replace(",", ";");
-            if (vals.length() > 0)
-                _lteStatus = base + ";" + vals;
+            base = _lastProfileName;
+            base.replace(" NB-IoT", ";NB-IoT");
+            base.replace(" Cat-M1", ";Cat-M1");
+        }
+        else if (haveQcsq)
+        {
+            base = "?;" + qcsqTechBg(qcsqResp);
+        }
+        else
+        {
+            base = "?;UNKNOWN";
         }
 
-        sendATWaitFor("AT+COPS?", "+COPS:", nullptr, 5000, nullptr);
+        if (haveQcsq)
+        {
+            String vals = qcsqValuesBg(qcsqResp);
+            if (vals.length() > 0)
+            {
+                vals.replace(",", ";");
+                vals.replace("\r", "");
+                vals.replace("\n", "");
+                vals.replace("\"", "");
+                vals.trim();
+
+                _lteStatus = base + ";" + vals;
+            }
+            else
+            {
+                _lteStatus = base;
+            }
+        }
+        else
+        {
+            _lteStatus = base;
+        }
+
+        updateProviderFromCops();
     }
 
     {
@@ -1027,10 +1347,20 @@ bool Bg77Mqtt::mqttReconnect()
         cmd += BROKER_HOST;
         cmd += "\",";
         cmd += String(BROKER_PORT);
+        String qmtopenResp;
 
-        if (!sendATWaitFor(cmd, "+QMTOPEN: 0,0", "ERROR", 60000, nullptr))
+        if (!sendATWaitFor(cmd, "+QMTOPEN:", "ERROR", 60000, &qmtopenResp))
         {
-            logError("QMTOPEN echec");
+            logError("QMTOPEN echec: no response");
+            _mqttSocketOpen = false;
+            _mqttConnected = false;
+            _mqttReconnectFailures++;
+            return false;
+        }
+
+        if (qmtopenResp.indexOf("+QMTOPEN: 0,0") < 0)
+        {
+            logError("QMTOPEN echec: " + qmtopenResp);
             _mqttSocketOpen = false;
             _mqttConnected = false;
             _mqttReconnectFailures++;
@@ -1324,26 +1654,73 @@ String Bg77Mqtt::getLteStatus() const
 String Bg77Mqtt::readLteSignal()
 {
     if (!_mqttConnected)
+    {
         return "";
+    }
 
     String qcsqResp;
-    sendATWaitFor("AT+QCSQ", "+QCSQ:", nullptr, 5000, &qcsqResp);
-
-    int closeQuote = qcsqResp.lastIndexOf('"');
-    if (closeQuote < 0)
+    if (!sendATWaitFor("AT+QCSQ", "+QCSQ:", nullptr, 5000, &qcsqResp))
+    {
         return "";
+    }
 
-    // +QCSQ: "LTE NB-IoT",RSSI,RSRP,SINR,RSRQ
-    String vals = qcsqResp.substring(closeQuote + 1);
-    vals.trim();
-    if (vals.startsWith(","))
-        vals = vals.substring(1);
+    String vals = qcsqValuesBg(qcsqResp);
+    if (vals.length() == 0)
+    {
+        return "";
+    }
 
     int rsrp = extractNthFieldBg(vals, 1);
     int rsrq = extractNthFieldBg(vals, 3);
 
     if (rsrp == -999 && rsrq == -999)
+    {
         return "";
+    }
 
     return String(rsrp) + ";" + String(rsrq);
+}
+
+String Bg77Mqtt::providerFromCopsResponse(const String &resp) const
+{
+    if (resp.indexOf("20820") >= 0 ||
+        resp.indexOf("Bouygues") >= 0 ||
+        resp.indexOf("BYTEL") >= 0)
+    {
+        return "Bouygues";
+    }
+
+    if (resp.indexOf("20801") >= 0 ||
+        resp.indexOf("Orange") >= 0)
+    {
+        return "Orange";
+    }
+
+    return "?";
+}
+
+void Bg77Mqtt::updateProviderFromCops()
+{
+    String copsResp;
+    String provider = "?";
+
+    if (sendATWaitFor("AT+COPS?", "+COPS:", nullptr, 5000, &copsResp))
+    {
+        provider = providerFromCopsResponse(copsResp);
+    }
+
+    if (_lteStatus.indexOf(";") >= 0)
+    {
+        int sep = _lteStatus.indexOf(";");
+        _lteStatus = provider + _lteStatus.substring(sep);
+    }
+    else
+    {
+        _lteStatus = provider + ";UNKNOWN";
+    }
+}
+
+String Bg77Mqtt::getLteScanSummary() const
+{
+    return _lastScanSummary;
 }

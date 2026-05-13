@@ -192,6 +192,7 @@ public:
      * @return "RSRP;RSRQ" string (e.g. "-97;-10"), or empty string if unavailable.
      */
     String readLteSignal();
+    String getLteScanSummary() const;
 
 private:
     Print &_pc;          ///< Diagnostic output stream.
@@ -208,7 +209,9 @@ private:
     /**
      * @brief Cached compact LTE status text.
      */
-    String _lteStatus;          //@@@@ for mqtt connection
+    String _lteStatus;
+    String _lastProfileName; ///< Last profile name that connected ("Bouygues NB-IoT" etc.)
+    String _lastScanSummary;
     uint16_t _mqttKeepAliveSec; ///< MQTT keepalive interval in seconds.
 
     uint32_t _lastMqttOkMs;         ///< millis() timestamp of the last successful MQTT activity.
@@ -216,6 +219,7 @@ private:
     uint32_t _disconnectedSinceMs;  ///< millis() timestamp when MQTT disconnection was first noticed.
     uint8_t _mqttReconnectFailures; ///< Consecutive MQTT reconnect failure count.
     bool _bootPowerCycleDone;       ///< true after the boot-time modem power cycle was attempted.
+    bool _bootProviderScanDone;     ///< true after the boot-time LTE profile scan was attempted.
 
     static constexpr uint32_t MAX_DISCONNECTED_MS = 30UL * 60UL * 1000UL;       ///< Maximum tolerated disconnected duration.
     static constexpr uint32_t MQTT_ACTIVITY_WATCHDOG_MS = 20UL * 60UL * 1000UL; ///< Maximum tolerated MQTT inactivity duration.
@@ -361,6 +365,13 @@ private:
     bool selectBestNbIot(bool *outPreferBouygues = nullptr);
 
     /**
+     * @brief Scans Bouygues/Orange on NB-IoT and Cat-M1, then selects the strongest profile.
+     *
+     * @return true if one LTE profile is selected and registered, false otherwise.
+     */
+    bool selectBestLteProfile();
+
+    /**
      * @brief Extracts the RSRP value from an AT+QCSQ response string.
      *
      * @param[in] qcsqResp Full response string from AT+QCSQ.
@@ -398,4 +409,7 @@ private:
      * @return Delay in milliseconds.
      */
     uint32_t reconnectBackoffMs() const;
+
+    String providerFromCopsResponse(const String &resp) const;
+    void updateProviderFromCops();
 };

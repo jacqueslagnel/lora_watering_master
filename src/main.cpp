@@ -76,6 +76,9 @@ static uint32_t vbat_pin = PIN_VBAT;
  * @brief Periodic heartbeat interval, in milliseconds.
  */
 static const uint32_t MQTT_PERIOD_MS = 10UL * 60UL * 1000UL;
+
+static const uint32_t MQTT_FIRST_HEARTBEAT_DELAY_MS = 60UL * 1000UL;
+
 #if MODEM == MODEM_SIM7080
 /**
  * @brief Selected LTE modem instance used by the application.
@@ -241,8 +244,23 @@ void loop()
     // @@@@ envoie mqtt on connect
     if (lte_modem.consumeJustConnected())
     {
-        lte_modem.publish("LTE_CONNECTED;" + lte_modem.getLteStatus());
+
+        String lteConnected = "LTE_CONNECTED;";
+        lteConnected += lte_modem.getLteStatus();
+
+        String scanSummary = lte_modem.getLteScanSummary();
+
+        if (scanSummary.length() > 0)
+        {
+            lteConnected += ";";
+            lteConnected += scanSummary;
+        }
+
+        lte_modem.publish(lteConnected);
+
         lora.republishAllNodePresence();
+
+        nextMqttPeriodicAt = millis() + MQTT_FIRST_HEARTBEAT_DELAY_MS;
     }
     processIncomingMqtt();
 

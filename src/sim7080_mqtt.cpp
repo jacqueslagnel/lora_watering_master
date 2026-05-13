@@ -572,7 +572,46 @@ bool Sim7080Mqtt::hasIPAddress()
     return ip.length() >= 7 && ip != "0.0.0.0";
 }
 
-bool Sim7080Mqtt::tryNetworkProfile(const char *name, const char *plmn, int act, int cmnb)
+static int extractNthField(const String &s, int n)
+{
+    int start = 0;
+    for (int i = 0; i < n; i++)
+    {
+        int comma = s.indexOf(',', start);
+        if (comma < 0)
+            return -999;
+        start = comma + 1;
+    }
+    int end = s.indexOf(',', start);
+    String val = (end >= 0) ? s.substring(start, end) : s.substring(start);
+    val.trim();
+    if (val.length() == 0)
+        return -999;
+    return (int)val.toInt();
+}
+
+int Sim7080Mqtt::extractRsrpFromCpsi(const String &cpsiResp)
+{
+    int cpsiIdx = cpsiResp.indexOf("+CPSI:");
+    if (cpsiIdx < 0)
+        return -999;
+
+    String cpsiLine = cpsiResp.substring(cpsiIdx + 6);
+    cpsiLine.trim();
+
+    // Skip first two fields (type="LTE NB" and status="Online")
+    int c1 = cpsiLine.indexOf(',');
+    int c2 = (c1 >= 0) ? cpsiLine.indexOf(',', c1 + 1) : -1;
+    if (c2 < 0)
+        return -999;
+
+    // Remaining: MCC-MNC,TAC,CID,Band,EARFCN,DLBW,ULBW,RSRQ,RSRP,...
+    // RSRP is at index 8 (0-based)
+    String sigPart = cpsiLine.substring(c2 + 1);
+    return extractNthField(sigPart, 8);
+}
+
+bool Sim7080Mqtt::tryNetworkProfile(const char *name, const char *plmn, int act, int cmnb, int *outRsrp)
 {
     logInfo(String("Essai profil LTE: ") + name);
 
@@ -617,7 +656,7 @@ bool Sim7080Mqtt::tryNetworkProfile(const char *name, const char *plmn, int act,
     logInfo(String("Profil LTE OK: ") + name);
 
     // Signal quality via AT+CPSI? (replaces BG77 AT+QCSQ)
-    // Response: +CPSI: LTE NB,Online,MCC-MNC,TAC,CID,BAND,EARFCN,...,RSRP,RSRQ,SINR,...
+    // Response: +CPSI: LTE NB,Online,MCC-MNC,TAC,CID,BAND,EARFCN,...,RSRQ,RSRP,RSSI,...
     String cpsiResp;
     sendATWaitFor("AT+CPSI?", "+CPSI:", nullptr, 5000, &cpsiResp);
     int cpsiIdx = cpsiResp.indexOf("+CPSI:");
@@ -638,6 +677,11 @@ bool Sim7080Mqtt::tryNetworkProfile(const char *name, const char *plmn, int act,
                 _lteStatus += sigPart;
             }
         }
+    }
+
+    if (outRsrp != nullptr)
+    {
+        *outRsrp = extractRsrpFromCpsi(cpsiResp);
     }
 
     sendATWaitFor("AT+COPS?", "+COPS:", nullptr, 5000, nullptr);
@@ -897,6 +941,61 @@ uint32_t Sim7080Mqtt::reconnectBackoffMs() const
     return backoff;
 }
 
+bool Sim7080Mqtt::selectBestNbIot(bool *outPreferBouygues)
+{
+    logInfo("[SCAN NB-IoT] Debut scan qualite signal...");
+
+    int rsrpBouygues = -999;
+    bool bouyguesOk = tryNetworkProfile("Bouygues NB-IoT", PLMN_BOUYGUES, ACT_NBIOT, 2, &rsrpBouygues);
+    if (bouyguesOk)
+        logInfo(String("[SCAN NB-IoT] Bouygues RSRP=") + String(rsrpBouygues) + " dBm");
+    else
+        logWarn("[SCAN NB-IoT] Bouygues NB-IoT indisponible");
+
+    // Soft deregister before scanning Orange
+    sendATOK("AT+COPS=2", 15000);
+    delay(2000);
+
+    int rsrpOrange = -999;
+    bool orangeOk = tryNetworkProfile("Orange NB-IoT", PLMN_ORANGE, ACT_NBIOT, 2, &rsrpOrange);
+    if (orangeOk)
+        logInfo(String("[SCAN NB-IoT] Orange RSRP=") + String(rsrpOrange) + " dBm");
+    else
+        logWarn("[SCAN NB-IoT] Orange NB-IoT indisponible");
+
+    // Determine preferred operator (used also to order Cat-M1 fallback if NB-IoT fails)
+    bool preferBouygues;
+    if (!bouyguesOk && !orangeOk)
+        preferBouygues = true; // no signal info — default to Bouygues
+    else
+        preferBouygues = bouyguesOk && (!orangeOk || rsrpBouygues >= rsrpOrange);
+
+    if (outPreferBouygues != nullptr)
+        *outPreferBouygues = preferBouygues;
+
+    if (!bouyguesOk && !orangeOk)
+    {
+        logWarn("[SCAN NB-IoT] Aucun operateur NB-IoT disponible");
+        return false;
+    }
+
+    if (preferBouygues)
+    {
+        logInfo(String("[SCAN NB-IoT] Meilleur: Bouygues RSRP=") + String(rsrpBouygues) + " dBm vs Orange=" + String(rsrpOrange) + " dBm");
+        // Orange may be currently registered — deregister before switching
+        if (orangeOk)
+        {
+            sendATOK("AT+COPS=2", 15000);
+            delay(2000);
+        }
+        return tryNetworkProfile("Bouygues NB-IoT", PLMN_BOUYGUES, ACT_NBIOT, 2);
+    }
+
+    // Orange is best and is currently the active registration
+    logInfo(String("[SCAN NB-IoT] Meilleur: Orange RSRP=") + String(rsrpOrange) + " dBm vs Bouygues=" + String(rsrpBouygues) + " dBm");
+    return true;
+}
+
 bool Sim7080Mqtt::init()
 {
     logInfo("Init complete LTE fallback + MQTT SIM7080G");
@@ -922,39 +1021,38 @@ bool Sim7080Mqtt::init()
 
         bool registered = false;
 
-        // cmnb: 2=NB-IoT, 1=LTE-M (replaces BG77 iotopmode 1=NB-IoT, 0=Cat-M1)
-        registered = tryNetworkProfile("Bouygues NB-IoT", PLMN_BOUYGUES, ACT_NBIOT, 2);
+        // Scan NB-IoT signal quality for both operators, register to the best one.
+        // preferBouygues informs the Cat-M1 fallback order when NB-IoT fails.
+        bool preferBouygues = true;
+        registered = selectBestNbIot(&preferBouygues);
 
         if (!registered)
         {
-            logWarn("Echec Bouygues NB-IoT -> power cycle SIM7080G");
+            logWarn("Echec scan NB-IoT -> power cycle SIM7080G");
+            modemPowerCycle();
+        }
+
+        // Cat-M1 fallback: try the operator preferred by the NB-IoT scan first
+        const char *catm1Plmn1 = preferBouygues ? PLMN_BOUYGUES : PLMN_ORANGE;
+        const char *catm1Name1 = preferBouygues ? "Bouygues Cat-M1" : "Orange Cat-M1";
+        const char *catm1Plmn2 = preferBouygues ? PLMN_ORANGE : PLMN_BOUYGUES;
+        const char *catm1Name2 = preferBouygues ? "Orange Cat-M1" : "Bouygues Cat-M1";
+
+        if (!registered)
+            registered = tryNetworkProfile(catm1Name1, catm1Plmn1, ACT_CATM1, 1);
+
+        if (!registered)
+        {
+            logWarn(String("Echec ") + catm1Name1 + " -> power cycle SIM7080G");
             modemPowerCycle();
         }
 
         if (!registered)
-            registered = tryNetworkProfile("Orange NB-IoT", PLMN_ORANGE, ACT_NBIOT, 2);
+            registered = tryNetworkProfile(catm1Name2, catm1Plmn2, ACT_CATM1, 1);
 
         if (!registered)
         {
-            logWarn("Echec Orange NB-IoT -> power cycle SIM7080G");
-            modemPowerCycle();
-        }
-
-        if (!registered)
-            registered = tryNetworkProfile("Bouygues Cat-M1", PLMN_BOUYGUES, ACT_CATM1, 1);
-
-        if (!registered)
-        {
-            logWarn("Echec Bouygues Cat-M1 -> power cycle SIM7080G");
-            modemPowerCycle();
-        }
-
-        if (!registered)
-            registered = tryNetworkProfile("Orange Cat-M1", PLMN_ORANGE, ACT_CATM1, 1);
-
-        if (!registered)
-        {
-            logWarn("Echec Orange Cat-M1 -> power cycle SIM7080G");
+            logWarn(String("Echec ") + catm1Name2 + " -> power cycle SIM7080G");
             modemPowerCycle();
             logError("Aucun profil LTE disponible");
             return false;
@@ -1184,4 +1282,36 @@ bool Sim7080Mqtt::consumeJustConnected()
 String Sim7080Mqtt::getLteStatus() const
 {
     return _lteStatus;
+}
+
+String Sim7080Mqtt::readLteSignal()
+{
+    if (!_mqttConnected)
+        return "";
+
+    String cpsiResp;
+    sendATWaitFor("AT+CPSI?", "+CPSI:", nullptr, 5000, &cpsiResp);
+
+    int cpsiIdx = cpsiResp.indexOf("+CPSI:");
+    if (cpsiIdx < 0)
+        return "";
+
+    String cpsiLine = cpsiResp.substring(cpsiIdx + 6);
+    cpsiLine.trim();
+
+    // Skip type ("LTE NB") and status ("Online")
+    int c1 = cpsiLine.indexOf(',');
+    int c2 = (c1 >= 0) ? cpsiLine.indexOf(',', c1 + 1) : -1;
+    if (c2 < 0)
+        return "";
+
+    // Remaining: MCC-MNC,TAC,CID,Band,EARFCN,DLBW,ULBW,RSRQ,RSRP,...
+    String sigPart = cpsiLine.substring(c2 + 1);
+    int rsrq = extractNthField(sigPart, 7);
+    int rsrp = extractNthField(sigPart, 8);
+
+    if (rsrp == -999 && rsrq == -999)
+        return "";
+
+    return String(rsrp) + ";" + String(rsrq);
 }

@@ -14,11 +14,11 @@
 /**
  * @brief Numeric selector for the SIM7080 modem implementation.
  */
-#define MODEM_SIM7080 1
+#define MODEM_SIM7080 2
 /**
  * @brief Numeric selector for the BG77 modem implementation.
  */
-#define MODEM_BG77 2
+#define MODEM_BG77 1
 
 /**
  * @brief Active modem selection used by the build.
@@ -320,6 +320,10 @@ static void publishHeartbeat()
     payload += String(lora.getOnlineNodeCount());
     payload += ";";
     payload += lora.getOnlineNodeListCsv();
+
+    String lteSignal = lte_modem.readLteSignal();
+    payload += ";";
+    payload += (lteSignal.length() > 0) ? lteSignal : "-999;-999";
 
     lte_modem.publish(payload);
 }

@@ -184,7 +184,14 @@ public:
      *
      * @return Cached LTE status text.
      */
-    String getLteStatus() const; //@@@ for mqtt connection
+    String getLteStatus() const;
+    /**
+     * @brief Queries the modem for current signal quality and returns "RSRP;RSRQ".
+     *
+     * Sends AT+QCSQ and parses the response. Only meaningful when MQTT is connected.
+     * @return "RSRP;RSRQ" string (e.g. "-97;-10"), or empty string if unavailable.
+     */
+    String readLteSignal();
 
 private:
     Print &_pc;          ///< Diagnostic output stream.
@@ -338,9 +345,28 @@ private:
      * @param[in] plmn PLMN string, or nullptr depending on implementation.
      * @param[in] act Access technology code.
      * @param[in] iotopmode BG77 IoT operation mode value.
+     * @param[out] outRsrp If non-null, receives the RSRP value read after registration (dBm), or -999 if unreadable.
      * @return true if the profile reaches usable network state, false otherwise.
      */
-    bool tryNetworkProfile(const char *name, const char *plmn, int act, int iotopmode);
+    bool tryNetworkProfile(const char *name, const char *plmn, int act, int iotopmode, int *outRsrp = nullptr);
+
+    /**
+     * @brief Scans NB-IoT signal quality for Bouygues and Orange, then registers to the best one.
+     *
+     * @param[out] outPreferBouygues If non-null, set to true if Bouygues had a better (or equal) signal,
+     *             false if Orange was better. Defaults to true when neither operator could be measured.
+     *             Useful for ordering the Cat-M1 fallback after NB-IoT failure.
+     * @return true if registration to the best NB-IoT operator succeeds, false if neither is available.
+     */
+    bool selectBestNbIot(bool *outPreferBouygues = nullptr);
+
+    /**
+     * @brief Extracts the RSRP value from an AT+QCSQ response string.
+     *
+     * @param[in] qcsqResp Full response string from AT+QCSQ.
+     * @return RSRP in dBm, or -999 if the value cannot be parsed.
+     */
+    int extractRsrpFromQcsq(const String &qcsqResp);
 
     /**
      * @brief Applies the MQTT keepalive value through modem configuration.

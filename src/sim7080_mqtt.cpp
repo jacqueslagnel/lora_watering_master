@@ -38,6 +38,22 @@ static const uint8_t SIM_PWRKEY_ACTIVE_LEVEL = HIGH; ///< Active GPIO level for 
  */
 static const uint32_t SIM_PWRKEY_PULSE_MS = 1200; // SIM7080G: >1s to power on
 
+static const int NBIOT_PREFERENCE_DB = 5;
+static const uint8_t LTE_SIGNAL_SAMPLE_COUNT = 6;
+static const uint32_t LTE_SIGNAL_SAMPLE_GAP_MS = 5000UL;
+
+static const uint32_t LTE_DEREGISTER_DELAY_MS = 10000UL;
+
+struct LteProfileCandidate
+{
+    const char *name;
+    const char *plmn;
+    int act;
+    int cmnb;
+    int rsrp;
+    bool ok;
+};
+
 /**
  * @brief Constructs the SIM7080 driver and initializes cached state.
  *
@@ -53,12 +69,15 @@ Sim7080Mqtt::Sim7080Mqtt(Print &pcSerial, Uart &modemSerial, uint32_t pwrKeyPin)
       _mqttConnected(false),
       _justConnected(false),
       _lteStatus("UNKNOWN;UNKNOWN"),
+      _lastProfileName(""),
+      _lastScanSummary("B_NBIOT=-999;O_NBIOT=-999;B_CATM1=-999;O_CATM1=-999"),
       _mqttKeepAliveSec(300),
       _lastMqttOkMs(0),
       _nextReconnectAtMs(0),
       _disconnectedSinceMs(0),
       _mqttReconnectFailures(0),
       _bootPowerCycleDone(false),
+      _bootProviderScanDone(false),
       _mqttQueueHead(0),
       _mqttQueueTail(0),
       _mqttQueueCount(0)
@@ -173,6 +192,11 @@ void Sim7080Mqtt::modemPowerPulse()
     delay(SIM_PWRKEY_PULSE_MS);
     digitalWrite(_pwrKeyPin, SIM_PWRKEY_IDLE_LEVEL);
     delay(1500);
+}
+
+void Sim7080Mqtt::bg77PowerPulse()
+{
+    modemPowerPulse();
 }
 
 void Sim7080Mqtt::clearModemInput()
@@ -579,36 +603,158 @@ static int extractNthField(const String &s, int n)
     {
         int comma = s.indexOf(',', start);
         if (comma < 0)
+        {
             return -999;
+        }
         start = comma + 1;
     }
+
     int end = s.indexOf(',', start);
     String val = (end >= 0) ? s.substring(start, end) : s.substring(start);
     val.trim();
+
     if (val.length() == 0)
+    {
         return -999;
+    }
+
     return (int)val.toInt();
+}
+
+static String extractCpsiLine(const String &resp)
+{
+    int pos = resp.indexOf("+CPSI:");
+    if (pos < 0)
+    {
+        return "";
+    }
+
+    int endN = resp.indexOf('\n', pos);
+    int endR = resp.indexOf('\r', pos);
+    int end = -1;
+
+    if (endN >= 0 && endR >= 0)
+    {
+        end = min(endN, endR);
+    }
+    else if (endN >= 0)
+    {
+        end = endN;
+    }
+    else if (endR >= 0)
+    {
+        end = endR;
+    }
+
+    String line = (end >= 0) ? resp.substring(pos, end) : resp.substring(pos);
+    line.trim();
+    return line;
+}
+
+static String cpsiPayload(const String &resp)
+{
+    String line = extractCpsiLine(resp);
+    if (line.length() == 0)
+    {
+        return "";
+    }
+
+    int colon = line.indexOf(':');
+    if (colon < 0)
+    {
+        return "";
+    }
+
+    String payload = line.substring(colon + 1);
+    payload.trim();
+    return payload;
+}
+
+static String cpsiTech(const String &resp)
+{
+    String payload = cpsiPayload(resp);
+    if (payload.length() == 0)
+    {
+        return "UNKNOWN";
+    }
+
+    int comma = payload.indexOf(',');
+    String tech = (comma >= 0) ? payload.substring(0, comma) : payload;
+    tech.trim();
+    tech.toUpperCase();
+
+    if (tech.indexOf("NB") >= 0)
+    {
+        return "NB-IoT";
+    }
+
+    if (tech.indexOf("CAT-M") >= 0 || tech.indexOf("LTE-M") >= 0 || tech.indexOf("M1") >= 0)
+    {
+        return "Cat-M1";
+    }
+
+    return "UNKNOWN";
+}
+
+static String cpsiSignalPart(const String &resp)
+{
+    String payload = cpsiPayload(resp);
+    if (payload.length() == 0)
+    {
+        return "";
+    }
+
+    // Skip first two fields: radio type and registration state.
+    int c1 = payload.indexOf(',');
+    int c2 = (c1 >= 0) ? payload.indexOf(',', c1 + 1) : -1;
+    if (c2 < 0)
+    {
+        return "";
+    }
+
+    String sigPart = payload.substring(c2 + 1);
+    sigPart.trim();
+    return sigPart;
 }
 
 int Sim7080Mqtt::extractRsrpFromCpsi(const String &cpsiResp)
 {
-    int cpsiIdx = cpsiResp.indexOf("+CPSI:");
-    if (cpsiIdx < 0)
+    String sigPart = cpsiSignalPart(cpsiResp);
+    if (sigPart.length() == 0)
+    {
         return -999;
+    }
 
-    String cpsiLine = cpsiResp.substring(cpsiIdx + 6);
-    cpsiLine.trim();
-
-    // Skip first two fields (type="LTE NB" and status="Online")
-    int c1 = cpsiLine.indexOf(',');
-    int c2 = (c1 >= 0) ? cpsiLine.indexOf(',', c1 + 1) : -1;
-    if (c2 < 0)
-        return -999;
-
-    // Remaining: MCC-MNC,TAC,CID,Band,EARFCN,DLBW,ULBW,RSRQ,RSRP,...
-    // RSRP is at index 8 (0-based)
-    String sigPart = cpsiLine.substring(c2 + 1);
+    // SIM7080 CPSI after type/status:
+    // MCC-MNC,TAC,CID,Band,EARFCN,DLBW,ULBW,RSRQ,RSRP,...
     return extractNthField(sigPart, 8);
+}
+
+int Sim7080Mqtt::extractRsrqFromCpsi(const String &cpsiResp)
+{
+    String sigPart = cpsiSignalPart(cpsiResp);
+    if (sigPart.length() == 0)
+    {
+        return -999;
+    }
+
+    return extractNthField(sigPart, 7);
+}
+
+String Sim7080Mqtt::buildLteStatusFromCpsi(const String &base, const String &cpsiResp) const
+{
+    int rsrp = const_cast<Sim7080Mqtt *>(this)->extractRsrpFromCpsi(cpsiResp);
+    int rsrq = const_cast<Sim7080Mqtt *>(this)->extractRsrqFromCpsi(cpsiResp);
+
+    // Keep the same logical shape as Bg77Mqtt:
+    // provider;tech;<aux1>;<RSRP>;<aux2>;<RSRQ>
+    // SIM7080 CPSI does not expose the exact same four QCSQ fields, so aux fields are 0.
+    String out = base;
+    out += ";0;";
+    out += String(rsrp);
+    out += ";0;";
+    out += String(rsrq);
+    return out;
 }
 
 bool Sim7080Mqtt::tryNetworkProfile(const char *name, const char *plmn, int act, int cmnb, int *outRsrp)
@@ -619,7 +765,7 @@ bool Sim7080Mqtt::tryNetworkProfile(const char *name, const char *plmn, int act,
     _packetAttached = false;
 
     {
-        // AT+CMNB: 1=LTE-M, 2=NB-IoT, 3=both (replaces BG77 AT+QCFG="iotopmode")
+        // AT+CMNB: 1=LTE-M, 2=NB-IoT, 3=both.
         String cmd = "AT+CMNB=";
         cmd += String(cmnb);
 
@@ -628,6 +774,7 @@ bool Sim7080Mqtt::tryNetworkProfile(const char *name, const char *plmn, int act,
             logWarn(String("CMNB refuse pour ") + name);
             return false;
         }
+        delay(10000);
     }
 
     {
@@ -649,42 +796,95 @@ bool Sim7080Mqtt::tryNetworkProfile(const char *name, const char *plmn, int act,
         return false;
     }
 
+    _lastProfileName = String(name);
     _lteStatus = String(name);
     _lteStatus.replace(" NB-IoT", ";NB-IoT");
     _lteStatus.replace(" Cat-M1", ";Cat-M1");
 
     logInfo(String("Profil LTE OK: ") + name);
 
-    // Signal quality via AT+CPSI? (replaces BG77 AT+QCSQ)
-    // Response: +CPSI: LTE NB,Online,MCC-MNC,TAC,CID,BAND,EARFCN,...,RSRQ,RSRP,RSSI,...
-    String cpsiResp;
-    sendATWaitFor("AT+CPSI?", "+CPSI:", nullptr, 5000, &cpsiResp);
-    int cpsiIdx = cpsiResp.indexOf("+CPSI:");
-    if (cpsiIdx >= 0)
+    String selectedCpsiResp = "";
+    int finalRsrp = -999;
+    uint8_t sampleCount = (outRsrp == nullptr) ? 1 : LTE_SIGNAL_SAMPLE_COUNT;
+    for (uint8_t i = 0; i < sampleCount; i++)
     {
-        String cpsiLine = cpsiResp.substring(cpsiIdx + 6);
-        cpsiLine.trim();
-        // Skip first two fields (type and "Online") to get signal data
-        int c1 = cpsiLine.indexOf(',');
-        int c2 = (c1 >= 0) ? cpsiLine.indexOf(',', c1 + 1) : -1;
-        if (c2 >= 0)
+        watchdogFeed();
+
+        if (i > 0)
         {
-            String sigPart = cpsiLine.substring(c2 + 1);
-            sigPart.replace(",", ";");
-            if (sigPart.length() > 0)
+            delay(LTE_SIGNAL_SAMPLE_GAP_MS);
+        }
+
+        delay(100);
+        clearModemInput();
+
+        String cpsiResp;
+
+        if (sendATWaitFor("AT+CPSI?", "+CPSI:", nullptr, 5000, &cpsiResp))
+        {
+            int rsrp = extractRsrpFromCpsi(cpsiResp);
+
+            logInfo(
+                String("CPSI mesure ") +
+                String(i + 1) +
+                "/" +
+                String(sampleCount) +
+                " pour " +
+                String(name) +
+                ": RSRP=" +
+                String(rsrp));
+
+            if (rsrp > -999)
             {
-                _lteStatus += ";";
-                _lteStatus += sigPart;
+                // Conservative choice: keep the worst RSRP observed.
+                if (finalRsrp == -999 || rsrp < finalRsrp)
+                {
+                    finalRsrp = rsrp;
+                    selectedCpsiResp = cpsiResp;
+                }
             }
+        }
+        else
+        {
+            logWarn(
+                String("CPSI mesure ") +
+                String(i + 1) +
+                "/" +
+                String(LTE_SIGNAL_SAMPLE_COUNT) +
+                " indisponible pour " +
+                String(name));
         }
     }
 
-    if (outRsrp != nullptr)
+    if (finalRsrp > -999)
     {
-        *outRsrp = extractRsrpFromCpsi(cpsiResp);
+        _lteStatus = buildLteStatusFromCpsi(_lteStatus, selectedCpsiResp);
+
+        if (outRsrp != nullptr)
+        {
+            *outRsrp = finalRsrp;
+        }
+
+        logInfo(
+            String("CPSI final pour ") +
+            String(name) +
+            ": worst_rsrp=" +
+            String(finalRsrp));
+    }
+    else
+    {
+        if (outRsrp != nullptr)
+        {
+            *outRsrp = -999;
+        }
+
+        logWarn(String("CPSI indisponible pour ") + String(name));
     }
 
-    sendATWaitFor("AT+COPS?", "+COPS:", nullptr, 5000, nullptr);
+    delay(100);
+    clearModemInput();
+
+    updateProviderFromCops();
 
     return true;
 }
@@ -752,11 +952,35 @@ bool Sim7080Mqtt::configureMqtt()
     return true;
 }
 
+bool Sim7080Mqtt::setMQTTKeepAliveInternal(uint16_t keepAliveSec)
+{
+    if (keepAliveSec > 0)
+    {
+        _mqttKeepAliveSec = keepAliveSec;
+    }
+
+    String cmd = "AT+SMCONF=\"KEEPTIME\",";
+    cmd += String(_mqttKeepAliveSec);
+
+    if (!sendATOK(cmd, 5000))
+    {
+        logError("SMCONF KEEPTIME refuse");
+        return false;
+    }
+
+    return true;
+}
+
 void Sim7080Mqtt::mqttDisconnect()
 {
     sendATOK("AT+SMDISC", 5000);
     _mqttConnected = false;
     printStateSnapshot("DISCONNECT");
+}
+
+void Sim7080Mqtt::mqttDisconnectClose()
+{
+    mqttDisconnect();
 }
 
 bool Sim7080Mqtt::mqttSubscribe()
@@ -954,7 +1178,7 @@ bool Sim7080Mqtt::selectBestNbIot(bool *outPreferBouygues)
 
     // Soft deregister before scanning Orange
     sendATOK("AT+COPS=2", 15000);
-    delay(2000);
+    delay(LTE_DEREGISTER_DELAY_MS);
 
     int rsrpOrange = -999;
     bool orangeOk = tryNetworkProfile("Orange NB-IoT", PLMN_ORANGE, ACT_NBIOT, 2, &rsrpOrange);
@@ -986,7 +1210,7 @@ bool Sim7080Mqtt::selectBestNbIot(bool *outPreferBouygues)
         if (orangeOk)
         {
             sendATOK("AT+COPS=2", 15000);
-            delay(2000);
+            delay(LTE_DEREGISTER_DELAY_MS);
         }
         return tryNetworkProfile("Bouygues NB-IoT", PLMN_BOUYGUES, ACT_NBIOT, 2);
     }
@@ -996,9 +1220,135 @@ bool Sim7080Mqtt::selectBestNbIot(bool *outPreferBouygues)
     return true;
 }
 
+bool Sim7080Mqtt::selectBestLteProfile()
+{
+    logInfo("[SCAN LTE] Debut scan complet Bouygues/Orange NB-IoT/Cat-M1 SIM7080G");
+
+    LteProfileCandidate profiles[] = {
+        {"Bouygues NB-IoT", PLMN_BOUYGUES, ACT_NBIOT, 2, -999, false},
+        {"Orange NB-IoT", PLMN_ORANGE, ACT_NBIOT, 2, -999, false},
+        {"Bouygues Cat-M1", PLMN_BOUYGUES, ACT_CATM1, 1, -999, false},
+        {"Orange Cat-M1", PLMN_ORANGE, ACT_CATM1, 1, -999, false},
+    };
+
+    const uint8_t profileCount = sizeof(profiles) / sizeof(profiles[0]);
+
+    int bestIndex = -1;
+    int bestScore = -9999;
+
+    for (uint8_t i = 0; i < profileCount; i++)
+    {
+        watchdogFeed();
+
+        if (i > 0)
+        {
+            sendATOK("AT+COPS=2", 15000);
+            delay(LTE_DEREGISTER_DELAY_MS);
+        }
+
+        profiles[i].ok = tryNetworkProfile(
+            profiles[i].name,
+            profiles[i].plmn,
+            profiles[i].act,
+            profiles[i].cmnb,
+            &profiles[i].rsrp);
+
+        if (profiles[i].ok)
+        {
+            int score = profiles[i].rsrp;
+
+            if (profiles[i].act == ACT_NBIOT)
+            {
+                score += NBIOT_PREFERENCE_DB;
+            }
+
+            logInfo(String("[SCAN LTE] ") + profiles[i].name +
+                    " OK RSRP=" + String(profiles[i].rsrp) +
+                    " dBm score=" + String(score));
+
+            if (bestIndex < 0 || score > bestScore)
+            {
+                bestIndex = i;
+                bestScore = score;
+            }
+        }
+        else
+        {
+            logWarn(String("[SCAN LTE] ") + profiles[i].name + " indisponible");
+        }
+    }
+
+    _lastScanSummary = "";
+
+    for (uint8_t i = 0; i < profileCount; i++)
+    {
+        if (i > 0)
+        {
+            _lastScanSummary += ";";
+        }
+
+        if (strcmp(profiles[i].name, "Bouygues NB-IoT") == 0)
+        {
+            _lastScanSummary += "B_NBIOT=";
+        }
+        else if (strcmp(profiles[i].name, "Orange NB-IoT") == 0)
+        {
+            _lastScanSummary += "O_NBIOT=";
+        }
+        else if (strcmp(profiles[i].name, "Bouygues Cat-M1") == 0)
+        {
+            _lastScanSummary += "B_CATM1=";
+        }
+        else if (strcmp(profiles[i].name, "Orange Cat-M1") == 0)
+        {
+            _lastScanSummary += "O_CATM1=";
+        }
+        else
+        {
+            _lastScanSummary += "UNKNOWN=";
+        }
+
+        if (profiles[i].ok)
+        {
+            _lastScanSummary += String(profiles[i].rsrp);
+        }
+        else
+        {
+            _lastScanSummary += "-999";
+        }
+    }
+
+    if (bestIndex < 0)
+    {
+        logWarn("[SCAN LTE] Aucun profil LTE disponible");
+        return false;
+    }
+
+    logInfo(String("[SCAN LTE] Meilleur profil: ") + profiles[bestIndex].name +
+            " RSRP=" + String(profiles[bestIndex].rsrp) +
+            " dBm score=" + String(bestScore));
+
+    sendATOK("AT+COPS=2", 15000);
+    delay(LTE_DEREGISTER_DELAY_MS);
+
+    bool selected = tryNetworkProfile(
+        profiles[bestIndex].name,
+        profiles[bestIndex].plmn,
+        profiles[bestIndex].act,
+        profiles[bestIndex].cmnb);
+
+    if (!selected)
+    {
+        logWarn(String("[SCAN LTE] Echec selection meilleur profil: ") + profiles[bestIndex].name);
+        return false;
+    }
+
+    return true;
+}
+
 bool Sim7080Mqtt::init()
 {
-    logInfo("Init complete LTE fallback + MQTT SIM7080G");
+    logInfo("Init complete LTE full scan + MQTT SIM7080G");
 
     if (!_bootPowerCycleDone)
     {
@@ -1015,44 +1365,27 @@ bool Sim7080Mqtt::init()
 
     updateRegistration();
 
-    if (!_networkRegistered)
+    bool registered = _networkRegistered;
+
+    if (!_bootProviderScanDone || !registered)
     {
-        sendATWaitFor("ATI", "OK", "ERROR", 5000, nullptr);
+        logInfo("Stabilisation radio avant scan LTE complet SIM7080G");
 
-        bool registered = false;
+        sendATOK("AT+CMNB=2", 5000);
 
-        // Scan NB-IoT signal quality for both operators, register to the best one.
-        // preferBouygues informs the Cat-M1 fallback order when NB-IoT fails.
-        bool preferBouygues = true;
-        registered = selectBestNbIot(&preferBouygues);
-
-        if (!registered)
+        uint32_t stableStart = millis();
+        while ((uint32_t)(millis() - stableStart) < 30000UL)
         {
-            logWarn("Echec scan NB-IoT -> power cycle SIM7080G");
-            modemPowerCycle();
+            watchdogFeed();
+            delay(1000);
         }
 
-        // Cat-M1 fallback: try the operator preferred by the NB-IoT scan first
-        const char *catm1Plmn1 = preferBouygues ? PLMN_BOUYGUES : PLMN_ORANGE;
-        const char *catm1Name1 = preferBouygues ? "Bouygues Cat-M1" : "Orange Cat-M1";
-        const char *catm1Plmn2 = preferBouygues ? PLMN_ORANGE : PLMN_BOUYGUES;
-        const char *catm1Name2 = preferBouygues ? "Orange Cat-M1" : "Bouygues Cat-M1";
-
-        if (!registered)
-            registered = tryNetworkProfile(catm1Name1, catm1Plmn1, ACT_CATM1, 1);
+        registered = selectBestLteProfile();
+        _bootProviderScanDone = true;
 
         if (!registered)
         {
-            logWarn(String("Echec ") + catm1Name1 + " -> power cycle SIM7080G");
-            modemPowerCycle();
-        }
-
-        if (!registered)
-            registered = tryNetworkProfile(catm1Name2, catm1Plmn2, ACT_CATM1, 1);
-
-        if (!registered)
-        {
-            logWarn(String("Echec ") + catm1Name2 + " -> power cycle SIM7080G");
+            logWarn("All LTE profiles failed, final SIM7080G power cycle");
             modemPowerCycle();
             logError("Aucun profil LTE disponible");
             return false;
@@ -1060,34 +1393,45 @@ bool Sim7080Mqtt::init()
     }
     else
     {
-        logInfo("Deja enregistre, reconnect direct");
+        logInfo("Deja enregistre, reconnect direct sans nouveau scan LTE complet");
+    }
+
+    if (registered)
+    {
+        logInfo("LTE enregistre, lecture statut radio SIM7080G");
 
         String cpsiResp;
-        sendATWaitFor("AT+CPSI?", "+CPSI:", nullptr, 5000, &cpsiResp);
-        int cpsiIdx = cpsiResp.indexOf("+CPSI:");
-        if (cpsiIdx >= 0)
+        bool haveCpsi = sendATWaitFor("AT+CPSI?", "+CPSI:", nullptr, 5000, &cpsiResp);
+
+        String base;
+        if (_lastProfileName.length() > 0)
         {
-            String cpsiLine = cpsiResp.substring(cpsiIdx + 6);
-            cpsiLine.trim();
-            int c1 = cpsiLine.indexOf(',');
-            int c2 = (c1 >= 0) ? cpsiLine.indexOf(',', c1 + 1) : -1;
-            if (c2 >= 0)
-            {
-                int s1 = _lteStatus.indexOf(';');
-                int s2 = (s1 >= 0) ? _lteStatus.indexOf(';', s1 + 1) : -1;
-                String base = (s2 >= 0) ? _lteStatus.substring(0, s2) : _lteStatus;
-                String sigPart = cpsiLine.substring(c2 + 1);
-                sigPart.replace(",", ";");
-                if (sigPart.length() > 0)
-                    _lteStatus = base + ";" + sigPart;
-            }
+            base = _lastProfileName;
+            base.replace(" NB-IoT", ";NB-IoT");
+            base.replace(" Cat-M1", ";Cat-M1");
+        }
+        else if (haveCpsi)
+        {
+            base = "?;" + cpsiTech(cpsiResp);
+        }
+        else
+        {
+            base = "?;UNKNOWN";
         }
 
-        sendATWaitFor("AT+COPS?", "+COPS:", nullptr, 5000, nullptr);
+        if (haveCpsi)
+        {
+            _lteStatus = buildLteStatusFromCpsi(base, cpsiResp);
+        }
+        else
+        {
+            _lteStatus = base;
+        }
+
+        updateProviderFromCops();
     }
 
     {
-        // AT+CGDCONT: standard 3GPP APN config (also present in SIM7080G APN manual config §4.2)
         String cmd = "AT+CGDCONT=1,\"IP\",\"";
         cmd += APN_NAME;
         cmd += "\"";
@@ -1125,16 +1469,13 @@ bool Sim7080Mqtt::init()
         }
     }
 
-    // AT+CNCFG + AT+CNACT: SIM7080G PDP context activation (mandatory, replaces BG77 CGPADDR)
     {
         String cmd = "AT+CNCFG=0,1,\"";
         cmd += APN_NAME;
         cmd += "\"";
-        sendATOK(cmd, 5000); // best-effort: may already be configured
+        sendATOK(cmd, 5000);
     }
 
-    // Activate PDP context 0; OK comes immediately, +APP PDP: 0,ACTIVE follows as URC.
-    // If the context is stuck in an old state, deactivate once and retry before failing.
     if (!sendATOK("AT+CNACT=0,1", 30000))
     {
         logWarn("CNACT=0,1 refuse, reset contexte PDP");
@@ -1146,11 +1487,17 @@ bool Sim7080Mqtt::init()
             return false;
         }
     }
-    pumpModem(2000); // drain +APP PDP: 0,ACTIVE URC
+
+    pumpModem(2000);
 
     if (!hasIPAddress())
     {
         logError("Pas d'adresse IP");
+        return false;
+    }
+
+    if (!setMQTTKeepAliveInternal(_mqttKeepAliveSec))
+    {
         return false;
     }
 
@@ -1314,4 +1661,154 @@ String Sim7080Mqtt::readLteSignal()
         return "";
 
     return String(rsrp) + ";" + String(rsrq);
+}
+
+String Sim7080Mqtt::getNetworkDateTime()
+{
+    String response;
+
+    if (!sendATWaitFor("AT+CCLK?", "+CCLK:", "ERROR", 10000, &response))
+    {
+        return "";
+    }
+
+    int firstQuote = response.indexOf('"');
+    int secondQuote = response.indexOf('"', firstQuote + 1);
+
+    if (firstQuote < 0 || secondQuote <= firstQuote)
+    {
+        return "";
+    }
+
+    return response.substring(firstQuote + 1, secondQuote);
+}
+
+String Sim7080Mqtt::convertQltsToIso8601(const String &qlts) const
+{
+    // SIM7080 AT+CCLK? example: 26/05/14,12:34:56+08
+    // BG77 AT+QLTS=2 example: 2026/05/14,12:34:56+08,0
+    String raw = qlts;
+    raw.trim();
+
+    int slash1 = raw.indexOf('/');
+    int slash2 = raw.indexOf('/', slash1 + 1);
+    int comma = raw.indexOf(',');
+    int colon1 = raw.indexOf(':', comma + 1);
+    int colon2 = raw.indexOf(':', colon1 + 1);
+
+    if (slash1 < 0 || slash2 < 0 || comma < 0 || colon1 < 0 || colon2 < 0)
+    {
+        return "";
+    }
+
+    String year = raw.substring(0, slash1);
+    if (year.length() == 2)
+    {
+        year = "20" + year;
+    }
+
+    String month = raw.substring(slash1 + 1, slash2);
+    String day = raw.substring(slash2 + 1, comma);
+    String hour = raw.substring(comma + 1, colon1);
+    String minute = raw.substring(colon1 + 1, colon2);
+    String second = raw.substring(colon2 + 1, colon2 + 3);
+
+    int signPosPlus = raw.indexOf('+', colon2 + 1);
+    int signPosMinus = raw.indexOf('-', colon2 + 1);
+    int signPos = -1;
+
+    if (signPosPlus >= 0)
+    {
+        signPos = signPosPlus;
+    }
+    else if (signPosMinus >= 0)
+    {
+        signPos = signPosMinus;
+    }
+
+    String tz = "+00:00";
+
+    if (signPos >= 0 && signPos + 3 <= (int)raw.length())
+    {
+        char sign = raw.charAt(signPos);
+        int quarterHours = raw.substring(signPos + 1, signPos + 3).toInt();
+        int totalMinutes = quarterHours * 15;
+        int hours = totalMinutes / 60;
+        int minutes = totalMinutes % 60;
+
+        char buffer[16];
+        snprintf(buffer, sizeof(buffer), "%c%02d:%02d", sign, hours, minutes);
+        tz = String(buffer);
+    }
+
+    String iso = "";
+    iso += year;
+    iso += "-";
+    iso += month;
+    iso += "-";
+    iso += day;
+    iso += "T";
+    iso += hour;
+    iso += ":";
+    iso += minute;
+    iso += ":";
+    iso += second;
+    iso += tz;
+
+    return iso;
+}
+
+String Sim7080Mqtt::getNetworkDateTimeIso8601()
+{
+    String raw = getNetworkDateTime();
+    if (raw.length() == 0)
+    {
+        return "";
+    }
+
+    return convertQltsToIso8601(raw);
+}
+
+String Sim7080Mqtt::providerFromCopsResponse(const String &resp) const
+{
+    if (resp.indexOf("20820") >= 0 ||
+        resp.indexOf("Bouygues") >= 0 ||
+        resp.indexOf("BYTEL") >= 0)
+    {
+        return "Bouygues";
+    }
+
+    if (resp.indexOf("20801") >= 0 ||
+        resp.indexOf("Orange") >= 0)
+    {
+        return "Orange";
+    }
+
+    return "?";
+}
+
+void Sim7080Mqtt::updateProviderFromCops()
+{
+    String copsResp;
+    String provider = "?";
+
+    if (sendATWaitFor("AT+COPS?", "+COPS:", nullptr, 5000, &copsResp))
+    {
+        provider = providerFromCopsResponse(copsResp);
+    }
+
+    if (_lteStatus.indexOf(";") >= 0)
+    {
+        int sep = _lteStatus.indexOf(";");
+        _lteStatus = provider + _lteStatus.substring(sep);
+    }
+    else
+    {
+        _lteStatus = provider + ";UNKNOWN";
+    }
+}
+
+String Sim7080Mqtt::getLteScanSummary() const
+{
+    return _lastScanSummary;
 }

@@ -815,8 +815,9 @@ bool Bg77Mqtt::tryNetworkProfile(const char *name,
 
     String selectedQcsqResp = "";
     int finalRsrp = -999;
+    uint8_t sampleCount = (outRsrp == nullptr) ? 1 : LTE_SIGNAL_SAMPLE_COUNT;
 
-    for (uint8_t i = 0; i < LTE_SIGNAL_SAMPLE_COUNT; i++)
+    for (uint8_t i = 0; i < sampleCount; i++)
     {
         watchdogFeed();
 
@@ -842,7 +843,7 @@ bool Bg77Mqtt::tryNetworkProfile(const char *name,
                 String("QCSQ mesure ") +
                 String(i + 1) +
                 "/" +
-                String(LTE_SIGNAL_SAMPLE_COUNT) +
+                String(sampleCount) +
                 " pour " +
                 String(name) +
                 ": RSRP=" +
@@ -1012,6 +1013,21 @@ bool Bg77Mqtt::selectBestLteProfile()
             profiles[i].act,
             profiles[i].iotopmode,
             &profiles[i].rsrp);
+
+        if (!profiles[i].ok)
+        {
+            logWarn(String("[SCAN LTE] Retry profil ") + profiles[i].name);
+
+            sendATOK("AT+COPS=2", 15000);
+            delay(5000);
+
+            profiles[i].ok = tryNetworkProfile(
+                profiles[i].name,
+                profiles[i].plmn,
+                profiles[i].act,
+                profiles[i].iotopmode,
+                &profiles[i].rsrp);
+        }
 
         if (profiles[i].ok)
         {

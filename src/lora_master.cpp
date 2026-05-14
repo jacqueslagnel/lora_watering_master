@@ -1014,7 +1014,8 @@ void LoRaMaster::processAckCmdFrame()
 {
     if (_rxSize < 3)
     {
-        printTsv("ACK_CMD_ERR", 0, 0, 0, 0, _lastRxRssi, _lastRxSnr, 0, "too_short_hdr");
+        printTsv("ACK_CMD_ERR", 0, 0, 0, 0,
+                 _lastRxRssi, _lastRxSnr, 0, "too_short_hdr");
         startContinuousRx();
         return;
     }
@@ -1024,20 +1025,9 @@ void LoRaMaster::processAckCmdFrame()
 
     if (_rxSize < 8)
     {
-        printTsv("ACK_CMD_ERR", nodeId, seq, 0, 0, _lastRxRssi, _lastRxSnr, 0, "too_short");
-        if (_awaitingAckNodeId != 0)
-        {
-            PendingNodeCommand *queued = getQueuedCommand(_awaitingAckNodeId);
-            if (queued != nullptr && queued->active)
-            {
-                publishQueuedCommandFailure(_awaitingAckNodeId, queued->cmdCode, queued->argU16);
-                clearQueuedCommand(_awaitingAckNodeId);
-            }
-        }
-        _awaitingAckNodeId = 0;
-        _awaitingAckSeq = 0;
-        _awaitingAckCmd = CMD_NONE;
-        _awaitingAckStartedMs = 0;
+        printTsv("ACK_CMD_ERR", nodeId, seq, 0, 0,
+                 _lastRxRssi, _lastRxSnr, 0, "too_short");
+
         startContinuousRx();
         return;
     }
@@ -1045,6 +1035,25 @@ void LoRaMaster::processAckCmdFrame()
     uint8_t payloadLen = _rxBuffer[3];
     uint8_t ackedCmd = _rxBuffer[4];
     uint8_t ackStatus = _rxBuffer[5];
+
+    if (_awaitingAckNodeId == 0)
+    {
+        printTsv("ACK_CMD_IGN", nodeId, seq, 0, 0,
+                 _lastRxRssi, _lastRxSnr, ackedCmd, "no_ack_expected");
+        startContinuousRx();
+        return;
+    }
+
+    if (_awaitingAckNodeId != nodeId ||
+        _awaitingAckSeq != seq ||
+        _awaitingAckCmd != ackedCmd)
+    {
+        printTsv("ACK_CMD_IGN", nodeId, seq, 0, 0,
+                 _lastRxRssi, _lastRxSnr, ackedCmd, "unexpected_ack");
+        startContinuousRx();
+        return;
+    }
+
     bool ok = (ackStatus == ACK_STATUS_OK);
 
     PendingNodeCommand *queued = getQueuedCommand(nodeId);
@@ -1055,7 +1064,8 @@ void LoRaMaster::processAckCmdFrame()
         {
             uint16_t batteryMv = (uint16_t)_rxBuffer[6] | ((uint16_t)_rxBuffer[7] << 8);
             updateNodeBattery(nodeId, batteryMv);
-            printTsv("ACK_CMD_RX", nodeId, seq, batteryMv, 0, _lastRxRssi, _lastRxSnr, ackedCmd, "battery_ok");
+            printTsv("ACK_CMD_RX", nodeId, seq, batteryMv, 0,
+                     _lastRxRssi, _lastRxSnr, ackedCmd, "battery_ok");
             publishBatteryResult(nodeId, true, batteryMv, 0, _lastRxRssi, _lastRxSnr);
         }
         else if (!_pendingCmdIsScheduled)
@@ -1063,7 +1073,7 @@ void LoRaMaster::processAckCmdFrame()
             publishBatteryResult(nodeId, false, 0, 0, 0, 0);
         }
 
-        if (_schedule.cycleActive && _awaitingAckNodeId == nodeId && _awaitingAckSeq == seq && _awaitingAckCmd == CMD_BATTERY)
+        if (_schedule.cycleActive)
         {
             markScheduleDoneForNode(nodeId);
         }
@@ -1078,9 +1088,15 @@ void LoRaMaster::processAckCmdFrame()
                                  ((uint32_t)_rxBuffer[10] << 8) |
                                  ((uint32_t)_rxBuffer[11] << 16) |
                                  ((uint32_t)_rxBuffer[12] << 24);
-            updateNodeStatus(nodeId, batteryMv, statusFlag, uptimeSec, (uint16_t)abs(_lastRxRssi), _lastRxSnr);
-            printTsv("ACK_CMD_RX", nodeId, seq, batteryMv, statusFlag, _lastRxRssi, _lastRxSnr, ackedCmd, "status_ok");
-            publishStatusResult(nodeId, true, batteryMv, statusFlag, uptimeSec, _lastRxRssi, _lastRxSnr);
+
+            updateNodeStatus(nodeId, batteryMv, statusFlag, uptimeSec,
+                             (uint16_t)abs(_lastRxRssi), _lastRxSnr);
+
+            printTsv("ACK_CMD_RX", nodeId, seq, batteryMv, statusFlag,
+                     _lastRxRssi, _lastRxSnr, ackedCmd, "status_ok");
+
+            publishStatusResult(nodeId, true, batteryMv, statusFlag,
+                                uptimeSec, _lastRxRssi, _lastRxSnr);
         }
         else
         {
@@ -1102,6 +1118,7 @@ void LoRaMaster::processAckCmdFrame()
                                   ((uint32_t)_rxBuffer[15] << 24);
 
             uint16_t litres = (uint16_t)_rxBuffer[16] | ((uint16_t)_rxBuffer[17] << 8);
+
             uint32_t postClosePulses = (uint32_t)_rxBuffer[18] |
                                        ((uint32_t)_rxBuffer[19] << 8) |
                                        ((uint32_t)_rxBuffer[20] << 16) |
@@ -1109,8 +1126,12 @@ void LoRaMaster::processAckCmdFrame()
 
             uint8_t postCloseLeakDetected = _rxBuffer[22];
 
-            updateNodeWaterStatus(nodeId, valveOpen, wateringActive, durationSec, remainingSec, flowPulses, litres);
-            printTsv("ACK_CMD_RX", nodeId, seq, 0, 0, _lastRxRssi, _lastRxSnr, ackedCmd, "wstatus_ok");
+            updateNodeWaterStatus(nodeId, valveOpen, wateringActive,
+                                  durationSec, remainingSec, flowPulses, litres);
+
+            printTsv("ACK_CMD_RX", nodeId, seq, 0, 0,
+                     _lastRxRssi, _lastRxSnr, ackedCmd, "wstatus_ok");
+
             publishWaterStatusResult(nodeId, true, valveOpen, wateringActive,
                                      durationSec, remainingSec, flowPulses, litres,
                                      postClosePulses, postCloseLeakDetected);
@@ -1170,8 +1191,12 @@ void LoRaMaster::processAckCmdFrame()
 
             uint8_t postCloseLeakDetected = _rxBuffer[22];
 
-            updateNodeWaterStatus(nodeId, valveOpen, wateringActive, durationSec, remainingSec, flowPulses, litres);
-            printTsv("ACK_CMD_RX", nodeId, seq, 0, 0, _lastRxRssi, _lastRxSnr, ackedCmd, "water_ok");
+            updateNodeWaterStatus(nodeId, valveOpen, wateringActive,
+                                  durationSec, remainingSec, flowPulses, litres);
+
+            printTsv("ACK_CMD_RX", nodeId, seq, 0, 0,
+                     _lastRxRssi, _lastRxSnr, ackedCmd, "water_ok");
+
             publishWaterStartResult(nodeId, true, valveOpen, wateringActive,
                                     durationSec, remainingSec, flowPulses, litres,
                                     postClosePulses, postCloseLeakDetected);
@@ -1181,7 +1206,6 @@ void LoRaMaster::processAckCmdFrame()
             publishWaterStartResult(nodeId, false, 0, 0, 0, 0, 0, 0, 0, 0);
         }
     }
-
     else if (ackedCmd == CMD_WATER_ABORT)
     {
         if (ok && payloadLen >= 19)
@@ -1190,6 +1214,7 @@ void LoRaMaster::processAckCmdFrame()
             uint8_t wateringActive = _rxBuffer[7];
             uint16_t durationSec = (uint16_t)_rxBuffer[8] | ((uint16_t)_rxBuffer[9] << 8);
             uint16_t remainingSec = (uint16_t)_rxBuffer[10] | ((uint16_t)_rxBuffer[11] << 8);
+
             uint32_t flowPulses = (uint32_t)_rxBuffer[12] |
                                   ((uint32_t)_rxBuffer[13] << 8) |
                                   ((uint32_t)_rxBuffer[14] << 16) |
@@ -1203,8 +1228,13 @@ void LoRaMaster::processAckCmdFrame()
                                        ((uint32_t)_rxBuffer[21] << 24);
 
             uint8_t postCloseLeakDetected = _rxBuffer[22];
-            updateNodeWaterStatus(nodeId, valveOpen, wateringActive, durationSec, remainingSec, flowPulses, litres);
-            printTsv("ACK_CMD_RX", nodeId, seq, 0, 0, _lastRxRssi, _lastRxSnr, ackedCmd, "abort_ok");
+
+            updateNodeWaterStatus(nodeId, valveOpen, wateringActive,
+                                  durationSec, remainingSec, flowPulses, litres);
+
+            printTsv("ACK_CMD_RX", nodeId, seq, 0, 0,
+                     _lastRxRssi, _lastRxSnr, ackedCmd, "abort_ok");
+
             publishWaterAbortResult(nodeId, true, valveOpen, wateringActive,
                                     durationSec, remainingSec, flowPulses, litres,
                                     postClosePulses, postCloseLeakDetected);
@@ -1218,19 +1248,25 @@ void LoRaMaster::processAckCmdFrame()
     {
         publishNodeOtaResult(nodeId, ok);
     }
+    else
+    {
+        printTsv("ACK_CMD_ERR", nodeId, seq, 0, 0,
+                 _lastRxRssi, _lastRxSnr, ackedCmd, "unknown_cmd");
+    }
 
-    if (queued != nullptr && queued->active && queued->awaitingAck && seq == queued->lastSeq && ackedCmd == queued->cmdCode)
+    if (queued != nullptr &&
+        queued->active &&
+        queued->awaitingAck &&
+        seq == queued->lastSeq &&
+        ackedCmd == queued->cmdCode)
     {
         clearQueuedCommand(nodeId);
     }
 
-    if (_awaitingAckNodeId == nodeId && _awaitingAckSeq == seq && _awaitingAckCmd == ackedCmd)
-    {
-        _awaitingAckNodeId = 0;
-        _awaitingAckSeq = 0;
-        _awaitingAckCmd = CMD_NONE;
-        _awaitingAckStartedMs = 0;
-    }
+    _awaitingAckNodeId = 0;
+    _awaitingAckSeq = 0;
+    _awaitingAckCmd = CMD_NONE;
+    _awaitingAckStartedMs = 0;
 
     if (ok)
     {

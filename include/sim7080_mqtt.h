@@ -134,6 +134,10 @@ public:
      */
     void setKeepAlive(uint16_t keepAliveSec);
 
+    String getNetworkDateTime();
+    String getNetworkDateTimeIso8601();
+    String convertQltsToIso8601(const String &qlts) const;
+
     /**
      * @brief Indicates whether an MQTT message is queued for consumption.
      *
@@ -160,12 +164,14 @@ public:
      * @brief Sends a SIM7080 PWRKEY pulse.
      */
     void modemPowerPulse();
+    void bg77PowerPulse();
     /**
      * @brief Returns a compact LTE status string.
      *
      * @return Cached LTE status text.
      */
     String getLteStatus() const;
+    String getLteScanSummary() const;
     /**
      * @brief Queries the modem for current signal quality and returns "RSRP;RSRQ".
      *
@@ -187,6 +193,8 @@ private:
     bool _mqttConnected;        ///< Cached MQTT connection state.
     bool _justConnected;        ///< One-shot flag set after a successful connection.
     String _lteStatus;          ///< Cached compact LTE status text.
+    String _lastProfileName;    ///< Last profile name that connected ("Bouygues NB-IoT" etc.).
+    String _lastScanSummary;    ///< Last full LTE scan summary.
     uint16_t _mqttKeepAliveSec; ///< MQTT keepalive interval in seconds.
 
     uint32_t _lastMqttOkMs;         ///< millis() timestamp of the last successful MQTT activity.
@@ -194,8 +202,9 @@ private:
     uint32_t _disconnectedSinceMs;  ///< millis() timestamp when MQTT disconnection was first noticed.
     uint8_t _mqttReconnectFailures; ///< Consecutive MQTT reconnect failure count.
     bool _bootPowerCycleDone;       ///< true after the boot-time modem power cycle was attempted.
+    bool _bootProviderScanDone;     ///< true after the boot-time provider scan was attempted.
 
-    static constexpr uint32_t MAX_DISCONNECTED_MS = 30UL * 60UL * 1000UL;       ///< Maximum tolerated disconnected duration.
+    static constexpr uint32_t MAX_DISCONNECTED_MS = 15UL * 60UL * 1000UL;       ///< Maximum tolerated disconnected duration. 15=every 10min ori=30min
     static constexpr uint32_t MQTT_ACTIVITY_WATCHDOG_MS = 20UL * 60UL * 1000UL; ///< Maximum tolerated MQTT inactivity duration.
     static constexpr uint8_t MQTT_QUEUE_SIZE = 4;                               ///< Number of inbound MQTT messages retained.
     String _mqttQueue[MQTT_QUEUE_SIZE];                                         ///< Ring buffer for inbound MQTT payloads.
@@ -338,6 +347,7 @@ private:
      * @return true if registration to the best NB-IoT operator succeeds, false if neither is available.
      */
     bool selectBestNbIot(bool *outPreferBouygues = nullptr);
+    bool selectBestLteProfile();
 
     /**
      * @brief Extracts the RSRP value from an AT+CPSI? response string.
@@ -346,6 +356,7 @@ private:
      * @return RSRP in dBm, or -999 if the value cannot be parsed.
      */
     int extractRsrpFromCpsi(const String &cpsiResp);
+    int extractRsrqFromCpsi(const String &cpsiResp);
 
     /**
      * @brief Configures MQTT parameters in the modem.
@@ -353,10 +364,12 @@ private:
      * @return true if configuration succeeds, false otherwise.
      */
     bool configureMqtt();
+    bool setMQTTKeepAliveInternal(uint16_t keepAliveSec);
     /**
      * @brief Disconnects the modem MQTT session.
      */
     void mqttDisconnect();
+    void mqttDisconnectClose();
     /**
      * @brief Subscribes to the configured MQTT command topic.
      *
@@ -376,4 +389,8 @@ private:
      * @return Delay in milliseconds.
      */
     uint32_t reconnectBackoffMs() const;
+
+    String providerFromCopsResponse(const String &resp) const;
+    void updateProviderFromCops();
+    String buildLteStatusFromCpsi(const String &base, const String &cpsiResp) const;
 };

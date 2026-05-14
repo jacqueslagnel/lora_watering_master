@@ -36,10 +36,7 @@ static const uint32_t MQTT_RETRY_DELAY_MS = 2000;    ///< Delay between immediat
 static const uint8_t BG77_PWRKEY_IDLE_LEVEL = LOW;    ///< Idle GPIO level for BG77 PWRKEY.
 static const uint8_t BG77_PWRKEY_ACTIVE_LEVEL = HIGH; ///< Active GPIO level for BG77 PWRKEY pulse.
 static const uint32_t BG77_PWRKEY_PULSE_MS = 900;     ///< BG77 PWRKEY pulse duration, in milliseconds.
-
-static const int NBIOT_PREFERENCE_DB = 5;
-static const uint8_t LTE_SIGNAL_SAMPLE_COUNT = 6;
-static const uint32_t LTE_SIGNAL_SAMPLE_GAP_MS = 5000UL;
+static const int NBIOT_PREFERENCE_DB = 4;
 
 struct LteProfileCandidate
 {
@@ -66,7 +63,7 @@ Bg77Mqtt::Bg77Mqtt(Print &pcSerial, Uart &modemSerial, uint32_t pwrKeyPin)
       _justConnected(false),
       _lteStatus("UNKNOWN;UNKNOWN"),
       _lastProfileName(""),
-      _lastScanSummary("B_NBIOT=-999;O_NBIOT=-999;B_CATM1=-999;O_CATM1=-999"),
+      _lastScanSummary("B_NBIOT=NA;O_NBIOT=NA;B_CATM1=NA;O_CATM1=NA"),
       _mqttKeepAliveSec(300),
       _lastMqttOkMs(0),
       _nextReconnectAtMs(0),
@@ -805,7 +802,6 @@ bool Bg77Mqtt::tryNetworkProfile(const char *name,
         logWarn(String("Pas d'enregistrement reseau pour ") + name);
         return false;
     }
-
     _lastProfileName = String(name);
     _lteStatus = String(name);
     _lteStatus.replace(" NB-IoT", ";NB-IoT");
@@ -813,72 +809,64 @@ bool Bg77Mqtt::tryNetworkProfile(const char *name,
 
     logInfo(String("Profil LTE OK: ") + name);
 
-    String selectedQcsqResp = "";
-    int finalRsrp = -999;
+    String qcsqResp1;
+    String qcsqResp2;
 
-    for (uint8_t i = 0; i < LTE_SIGNAL_SAMPLE_COUNT; i++)
+    int rsrp1 = -999;
+    int rsrp2 = -999;
+
+    bool haveQcsq1 = sendATWaitFor("AT+QCSQ", "+QCSQ:", nullptr, 5000, &qcsqResp1);
+
+    if (haveQcsq1)
     {
-        watchdogFeed();
-
-        if (i > 0)
-        {
-            delay(LTE_SIGNAL_SAMPLE_GAP_MS);
-        }
-
-        delay(100);
-
-        while (_modem.available())
-        {
-            _modem.read();
-        }
-
-        String qcsqResp;
-
-        if (sendATWaitFor("AT+QCSQ", "+QCSQ:", nullptr, 5000, &qcsqResp))
-        {
-            int rsrp = extractRsrpFromQcsq(qcsqResp);
-
-            logInfo(
-                String("QCSQ mesure ") +
-                String(i + 1) +
-                "/" +
-                String(LTE_SIGNAL_SAMPLE_COUNT) +
-                " pour " +
-                String(name) +
-                ": RSRP=" +
-                String(rsrp));
-
-            if (rsrp > -999)
-            {
-                /*
-                 * Conservative choice:
-                 * keep the worst RSRP observed during the sampling window.
-                 *
-                 * This avoids selecting a profile only because of a short
-                 * optimistic peak just after registration.
-                 */
-                if (finalRsrp == -999 || rsrp < finalRsrp)
-                {
-                    finalRsrp = rsrp;
-                    selectedQcsqResp = qcsqResp;
-                }
-            }
-        }
-        else
-        {
-            logWarn(
-                String("QCSQ mesure ") +
-                String(i + 1) +
-                "/" +
-                String(LTE_SIGNAL_SAMPLE_COUNT) +
-                " indisponible pour " +
-                String(name));
-        }
+        rsrp1 = extractRsrpFromQcsq(qcsqResp1);
     }
 
-    if (finalRsrp > -999)
+    logInfo(
+        String("QCSQ mesure 1 pour ") +
+        String(name) +
+        ": RSRP=" +
+        String(rsrp1));
+
+    delay(10000);
+
+    // Important: let late URCs arrive, then consume them before the second QCSQ.
+    delay(200);
+    while (_modem.available())
     {
-        String vals = qcsqValuesBg(selectedQcsqResp);
+        _modem.read();
+    }
+
+    bool haveQcsq2 = sendATWaitFor("AT+QCSQ", "+QCSQ:", nullptr, 5000, &qcsqResp2);
+
+    if (haveQcsq2)
+    {
+        rsrp2 = extractRsrpFromQcsq(qcsqResp2);
+    }
+
+    logInfo(
+        String("QCSQ mesure 2 pour ") +
+        String(name) +
+        ": RSRP=" +
+        String(rsrp2));
+
+    String bestQcsqResp;
+    int bestRsrp = -999;
+
+    if (rsrp2 > rsrp1)
+    {
+        bestQcsqResp = qcsqResp2;
+        bestRsrp = rsrp2;
+    }
+    else
+    {
+        bestQcsqResp = qcsqResp1;
+        bestRsrp = rsrp1;
+    }
+
+    if (bestRsrp > -999)
+    {
+        String vals = qcsqValuesBg(bestQcsqResp);
 
         if (vals.length() > 0)
         {
@@ -894,14 +882,18 @@ bool Bg77Mqtt::tryNetworkProfile(const char *name,
 
         if (outRsrp != nullptr)
         {
-            *outRsrp = finalRsrp;
+            *outRsrp = bestRsrp;
         }
 
         logInfo(
-            String("QCSQ final pour ") +
+            String("QCSQ meilleur pour ") +
             String(name) +
-            ": worst_rsrp=" +
-            String(finalRsrp));
+            ": rsrp1=" +
+            String(rsrp1) +
+            " rsrp2=" +
+            String(rsrp2) +
+            " best=" +
+            String(bestRsrp));
     }
     else
     {
@@ -913,8 +905,8 @@ bool Bg77Mqtt::tryNetworkProfile(const char *name,
         logWarn(String("QCSQ indisponible pour ") + String(name));
     }
 
-    delay(100);
-
+    // Important before COPS? because a late QCSQ line can otherwise pollute the next response.
+    delay(200);
     while (_modem.available())
     {
         _modem.read();
@@ -1017,18 +1009,6 @@ bool Bg77Mqtt::selectBestLteProfile()
         {
             int score = profiles[i].rsrp;
 
-            /*
-             * Prefer NB-IoT when the difference is small.
-             *
-             * Example:
-             * B_NBIOT = -92, B_CATM1 = -91
-             *
-             * Without bonus, Cat-M1 wins.
-             * With +5 dB bonus:
-             * NB-IoT score = -87
-             * Cat-M1 score = -91
-             * NB-IoT wins.
-             */
             if (profiles[i].act == ACT_NBIOT)
             {
                 score += NBIOT_PREFERENCE_DB;
